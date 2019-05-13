@@ -1,6 +1,8 @@
 ﻿using System;
 using System.Threading;
 using System.Threading.Tasks;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace Foundatio.Utility {
     public interface ISystemClock {
@@ -11,6 +13,10 @@ namespace Foundatio.Utility {
         void Sleep(int milliseconds);
         Task SleepAsync(int milliseconds, CancellationToken ct);
         TimeSpan TimeZoneOffset();
+        void ScheduleWork(Func<Task> action, TimeSpan delay, TimeSpan? interval = null);
+        void ScheduleWork(Action action, TimeSpan delay, TimeSpan? interval = null);
+        void ScheduleWork(Func<Task> action, DateTime executeAt, TimeSpan? interval = null);
+        void ScheduleWork(Action action, DateTime executeAt, TimeSpan? interval = null);
     }
 
     public class RealSystemClock : ISystemClock {
@@ -23,6 +29,14 @@ namespace Foundatio.Utility {
         public void Sleep(int milliseconds) => Thread.Sleep(milliseconds);
         public Task SleepAsync(int milliseconds, CancellationToken ct) => Task.Delay(milliseconds, ct);
         public TimeSpan TimeZoneOffset() => DateTimeOffset.Now.Offset;
+        public void ScheduleWork(Func<Task> action, TimeSpan delay, TimeSpan? interval = null)
+            => WorkScheduler.Default.Schedule(action, delay, interval);
+        public void ScheduleWork(Action action, TimeSpan delay, TimeSpan? interval = null)
+            => WorkScheduler.Default.Schedule(action, delay, interval);
+        public void ScheduleWork(Func<Task> action, DateTime executeAt, TimeSpan? interval = null)
+            => WorkScheduler.Default.Schedule(action, executeAt, interval);
+        public void ScheduleWork(Action action, DateTime executeAt, TimeSpan? interval = null)
+            => WorkScheduler.Default.Schedule(action, executeAt, interval);
     }
 
     internal class TestSystemClockImpl : ISystemClock, IDisposable {
@@ -43,10 +57,30 @@ namespace Foundatio.Utility {
         public DateTimeOffset OffsetNow() => new DateTimeOffset(UtcNow().Ticks + TimeZoneOffset().Ticks, TimeZoneOffset());
         public DateTimeOffset OffsetUtcNow() => new DateTimeOffset(UtcNow().Ticks, TimeSpan.Zero);
         public TimeSpan TimeZoneOffset() => _timeZoneOffset;
+        public void ScheduleWork(Action action, TimeSpan delay, TimeSpan? interval = null)
+            => WorkScheduler.Default.Schedule(action, delay, interval);
+        public void ScheduleWork(Func<Task> action, TimeSpan delay, TimeSpan? interval = null)
+            => WorkScheduler.Default.Schedule(action, delay, interval);
+        public void ScheduleWork(Action action, DateTime executeAtUtc, TimeSpan? interval = null)
+            => WorkScheduler.Default.Schedule(action, executeAtUtc, interval);
+        public void ScheduleWork(Func<Task> action, DateTime executeAtUtc, TimeSpan? interval = null)
+            => WorkScheduler.Default.Schedule(action, executeAtUtc, interval);
 
-        public void SetTimeZoneOffset(TimeSpan offset) => _timeZoneOffset = offset;
-        public void AddTime(TimeSpan amount) => _offset = _offset.Add(amount);
-        public void SubtractTime(TimeSpan amount) => _offset = _offset.Subtract(amount);
+        public void SetTimeZoneOffset(TimeSpan offset) {
+            _timeZoneOffset = offset;
+            OnChanged();
+        }
+
+        public void AddTime(TimeSpan amount) {
+            _offset = _offset.Add(amount);
+            OnChanged();
+        }
+
+        public void SubtractTime(TimeSpan amount) {
+            _offset = _offset.Subtract(amount);
+            OnChanged();
+        }
+
         public void UseFakeSleep() => _fakeSleep = true;
         public void UseRealSleep() => _fakeSleep = false;
         
@@ -68,8 +102,10 @@ namespace Foundatio.Utility {
             return Task.CompletedTask;
         }
 
-        public void Freeze() {
-            SetFrozenTime(Now());
+        public DateTime Freeze() {
+            var now = Now();
+            SetFrozenTime(now);
+            return now;
         }
 
         public void Unfreeze() {
@@ -77,6 +113,7 @@ namespace Foundatio.Utility {
         }
 
         public void SetFrozenTime(DateTime time) {
+            UseFakeSleep();
             SetTime(time, true);
         }
 
@@ -88,8 +125,10 @@ namespace Foundatio.Utility {
 
                 if (time.Kind == DateTimeKind.Utc) {
                     _fixedUtc = time;
+                    OnChanged();
                 } else if (time.Kind == DateTimeKind.Local) {
                     _fixedUtc = new DateTime(time.Ticks - TimeZoneOffset().Ticks, DateTimeKind.Utc);
+                    OnChanged();
                 }
             } else {
                 _fixedUtc = null;
@@ -99,19 +138,22 @@ namespace Foundatio.Utility {
 
                 if (time.Kind == DateTimeKind.Utc) {
                     _offset = now.ToUniversalTime().Subtract(time);
+                    OnChanged();
                 } else if (time.Kind == DateTimeKind.Local) {
                     _offset = now.Subtract(time);
+                    OnChanged();
                 }
             }
         }
+
+        public event EventHandler Changed;
+
+        private void OnChanged() {
+            Changed?.Invoke(this, EventArgs.Empty);
+        }
         
         public void Dispose() {
-            if (_originalClock == null)
-                return;
-            
-            var originalClock = Interlocked.Exchange(ref _originalClock, null);
-            if (originalClock != null)
-                SystemClock.Instance = originalClock;
+            SystemClock.SetInstance(_originalClock, null);
         }
         
         public static TestSystemClockImpl Instance {
@@ -130,14 +172,28 @@ namespace Foundatio.Utility {
         public static void SubtractTime(TimeSpan amount) => TestSystemClockImpl.Instance.SubtractTime(amount);
         public static void UseFakeSleep() => TestSystemClockImpl.Instance.UseFakeSleep();
         public static void UseRealSleep() => TestSystemClockImpl.Instance.UseRealSleep();
-        public static void Freeze() => TestSystemClockImpl.Instance.Freeze();
+        public static DateTime Freeze() => TestSystemClockImpl.Instance.Freeze();
         public static void Unfreeze() => TestSystemClockImpl.Instance.Unfreeze();
         public static void SetFrozenTime(DateTime time) => TestSystemClockImpl.Instance.SetFrozenTime(time);
         public static void SetTime(DateTime time, bool freeze = false) => TestSystemClockImpl.Instance.SetTime(time, freeze);
 
-        public static IDisposable Install() {
+        public static event EventHandler Changed {
+            add => TestSystemClockImpl.Instance.Changed += value;
+            remove => TestSystemClockImpl.Instance.Changed -= value;
+        }
+
+        public static IDisposable Install(ILoggerFactory loggerFactory) {
+            return Install(true, loggerFactory);
+        }
+
+        public static IDisposable Install(bool freeze = true, ILoggerFactory loggerFactory = null) {
             var testClock = new TestSystemClockImpl(SystemClock.Instance);
-            SystemClock.Instance = testClock;
+            SystemClock.SetInstance(testClock, loggerFactory);
+            if (freeze)
+                testClock.Freeze();
+            
+            if (loggerFactory != null)
+                WorkScheduler.Default.SetLogger(loggerFactory);
             
             return testClock;
         }
@@ -146,13 +202,32 @@ namespace Foundatio.Utility {
     public static class SystemClock {
         private static AsyncLocal<ISystemClock> _instance;
         
-        public static ISystemClock Instance {
-            get => _instance?.Value ?? RealSystemClock.Instance;
-            set {
-                if (_instance == null)
-                    _instance = new AsyncLocal<ISystemClock>();
-                
-                _instance.Value = value;
+        public static ISystemClock Instance => _instance?.Value ?? RealSystemClock.Instance;
+
+        public static void SetInstance(ISystemClock clock, ILoggerFactory loggerFactory) {
+            var logger = loggerFactory?.CreateLogger("SystemClock") ?? NullLogger.Instance;
+            _instance = new AsyncLocal<ISystemClock>(e => {
+                if (e.ThreadContextChanged)
+                    return;
+
+                if (e.PreviousValue != null && e.CurrentValue != null) {
+                    var diff = e.PreviousValue.Now().Subtract(e.CurrentValue.Now());
+                    logger.LogTrace("SystemClock instance is being changed by {ThreadId} from {OldTime} to {NewTime} diff {Difference:g}", Thread.CurrentThread.ManagedThreadId, e.PreviousValue?.Now(), e.CurrentValue?.Now(), diff);
+                }
+
+                if (e.PreviousValue == null)
+                    logger.LogTrace("SystemClock instance is being initially set by {ThreadId} to {NewTime}", Thread.CurrentThread.ManagedThreadId, e.CurrentValue?.Now());
+
+                if (e.CurrentValue == null)
+                    logger.LogTrace("SystemClock instance is being removed set by {ThreadId} from {OldTime}", Thread.CurrentThread.ManagedThreadId, e.PreviousValue?.Now());
+            });
+
+            if (clock == null || clock is RealSystemClock) {
+                if (_instance != null)
+                    _instance.Value = null;
+                _instance = null;
+            } else {
+                _instance.Value = clock;
             }
         }
 
@@ -164,9 +239,15 @@ namespace Foundatio.Utility {
         public static void Sleep(int milliseconds) => Instance.Sleep(milliseconds);
         public static Task SleepAsync(int milliseconds, CancellationToken cancellationToken = default)
             => Instance.SleepAsync(milliseconds, cancellationToken);
-        
-        #region Extensions
-        
+        public static void ScheduleWork(Action action, TimeSpan delay, TimeSpan? interval = null)
+            => Instance.ScheduleWork(action, delay, interval);
+        public static void ScheduleWork(Func<Task> action, TimeSpan delay, TimeSpan? interval = null)
+            => Instance.ScheduleWork(action, delay, interval);
+        public static void ScheduleWork(Action action, DateTime executeAt, TimeSpan? interval = null)
+            => Instance.ScheduleWork(action, executeAt, interval);
+        public static void ScheduleWork(Func<Task> action, DateTime executeAt, TimeSpan? interval = null)
+            => Instance.ScheduleWork(action, executeAt, interval);
+
         public static void Sleep(TimeSpan delay)
             => Instance.Sleep(delay);
         
@@ -179,8 +260,6 @@ namespace Foundatio.Utility {
         
         public static Task SleepSafeAsync(TimeSpan delay, CancellationToken cancellationToken = default)
             => Instance.SleepSafeAsync(delay, cancellationToken);
-        
-        #endregion
     }
  
     public static class TimeExtensions {
